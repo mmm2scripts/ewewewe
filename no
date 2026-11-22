@@ -6583,13 +6583,13 @@ do
 		local pg = game:GetService("Players").LocalPlayer:WaitForChild("PlayerGui")
 		local handled = false
 		while gui.Parent do
-			task.wait(0.25)
+			task.wait(0.1)
 			pcall(function()
 				local req = dig(pg, "MainGUI", "Game", "Leaderboard", "Container", "TradeRequest", "ReceivingRequest")
 				if (SETTINGS.autoAccept or H.beg.running) and req and req.Visible then
 					if not handled then
 						handled = true
-						task.wait(0.3)
+						task.wait(0.1)
 						local btn = findAccept(req)
 						if btn then
 							local who = dig(req, "Username")
@@ -6730,6 +6730,28 @@ do
 	end
 
 	-- the open trade (if any), read straight from the game so it works on every tab / with the window hidden
+	-- fast "a trade is opening" signal: the trade GUI showing, or any Trade remote event in the last 3 s.
+	-- while it is hot the loops poll much faster so the accept starts the moment the trade opens.
+	B.lastEvt = -1e9
+	for _, r in ipairs(Trade:GetChildren()) do
+		if r:IsA("RemoteEvent") then
+			track(r.OnClientEvent:Connect(function()
+				B.lastEvt = os.clock()
+			end))
+		end
+	end
+	local function tradeHot()
+		if os.clock() - B.lastEvt < 3 then
+			return true
+		end
+		local g = PlayerGui:FindFirstChild("TradeGUI")
+		if g and g:IsA("ScreenGui") and g.Enabled then
+			local c = g:FindFirstChild("Container")
+			return c == nil or (c:IsA("GuiObject") and c.Visible)
+		end
+		return false
+	end
+
 	local function peekTrade()
 		local _, _, packed = getStatus()
 		if not packed then
@@ -6897,7 +6919,7 @@ do
 					B.setStatus(stageConfirm and "pressed Confirm" or "pressed Accept")
 				end
 			end
-			task.wait(0.25)
+			task.wait(0.12)
 		end
 		return fires > 0, lastList
 	end
@@ -7062,24 +7084,42 @@ do
 			if not (myHrp and myHum and hrp) then
 				return "lost them"
 			end
-			local dist = (myHrp.Position - hrp.Position).Magnitude
-			if dist > 9 then
-				-- teleport next to them (and again whenever they move away)
-				B.setStatus(string.format("teleporting to %s", p.DisplayName))
-				myHrp.CFrame = hrp.CFrame * CFrame.new(0, 0, 4)
+			-- stand 4 studs IN FRONT of them, looking at them. a smooth tween, never a snap.
+			local front = hrp.CFrame.Position + hrp.CFrame.LookVector * 4
+			local goal = CFrame.lookAt(front, Vector3.new(hrp.Position.X, front.Y, hrp.Position.Z))
+			local dist = (myHrp.Position - front).Magnitude
+			if dist > 5 then
+				B.setStatus(string.format("moving to %s", p.DisplayName))
 				myHrp.AssemblyLinearVelocity = Vector3.zero
+				local dur = math.clamp(dist / 110, 0.18, 1.1)
+				local tw = TweenService:Create(myHrp, TweenInfo.new(dur, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut),
+					{ CFrame = goal })
+				tw:Play()
+				local t0 = os.clock()
+				while os.clock() - t0 < dur + 0.1 and B.running and gui.Parent and p.Parent do
+					if tradeHot() and peekTrade() then
+						break   -- a trade opened mid-move: stop and handle it
+					end
+					task.wait(0.05)
+				end
+				pcall(function() tw:Cancel() end)
 				if os.clock() - startT > 30 and not arrivedT then
 					return "could not reach"
 				end
 			else
 				arrivedT = arrivedT or os.clock()
+				-- keep looking at them (gentle turn, position unchanged)
+				pcall(function()
+					local face = CFrame.lookAt(myHrp.Position, Vector3.new(hrp.Position.X, myHrp.Position.Y, hrp.Position.Z))
+					myHrp.CFrame = myHrp.CFrame:Lerp(face, 0.45)
+				end)
 				local left = SETTINGS.begWait - (os.clock() - arrivedT)
 				B.setStatus(string.format("asking %s  ·  %d s left", p.DisplayName, math.max(0, math.ceil(left))))
 				if left <= 0 then
 					return "no trade"
 				end
 			end
-			task.wait(0.4)
+			task.wait(tradeHot() and 0.1 or 0.3)
 		end
 		return "stopped"
 	end
