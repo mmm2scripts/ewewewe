@@ -7020,13 +7020,23 @@ do
 		local ok, why = hopRandom()
 		return ok, why
 	end
-	local function runTarget(p)
+	local function runTargetInner(p)
 		B.target = p
 		B.paint()
 		local msgs = messages()
 		local startT, arrivedT = os.clock(), nil
 		local asked, tries = false, 0   -- ONE message per person
 		local wasOpen, declines = false, 0
+
+		-- inventory BEFORE the trade (read in the background while we message / walk over). Used afterwards to
+		-- confirm the items really arrived. nil = could not be read, then the trade is trusted as before.
+		local base
+		task.spawn(function()
+			local ok, m, rep = pcall(H.detectInventory)
+			if ok and m and rep and not rep.guiOnly then
+				base = m
+			end
+		end)
 
 		while B.running and gui.Parent do
 			if not p.Parent then
@@ -7065,9 +7075,39 @@ do
 					if finalList and #finalList >= #gotList then
 						gotList = finalList
 					end
+					-- the trade is over: did the items really land in our inventory?
+					if base then
+						B.setStatus("trade closed - checking inventory...")
+						local got = false
+						for _ = 1, 3 do
+							task.wait(2)
+							if not (B.running and gui.Parent) then
+								break
+							end
+							local ok, m, rep = pcall(H.detectInventory)
+							if not (ok and m and rep and not rep.guiOnly) then
+								got = true   -- inventory unreadable now: cannot disprove it, trust the trade
+								break
+							end
+							for _, it in ipairs(gotList) do
+								if (m[it.dataID] or 0) > (base[it.dataID] or 0) then
+									got = true
+									break
+								end
+							end
+							if got then
+								break
+							end
+						end
+						if not got then
+							log("Beg: trade with " .. tostring(sides.theirName) .. " finished but the items are NOT in the inventory - continuing to beg")
+							B.setStatus("items not received - continuing to beg")
+							return "trade failed (items not received)"
+						end
+					end
 					B.accepted = B.accepted + 1
 					B.paint()
-					log("Beg: accepted a trade (" .. tostring(sides.theirName) .. ")")
+					log("Beg: accepted a trade (" .. tostring(sides.theirName) .. ") - items confirmed in inventory")
 					H.sendHook("Trade accepted",
 						string.format("Accepted a trade from **%s**.\nAccount: **%s**\nAccepted this session: **%d**\n\n**Items received:**\n%s",
 							tostring(sides.theirName or "?"), MY_NAME, B.accepted, H.itemLines(gotList)), 3899126)
@@ -7084,11 +7124,17 @@ do
 			if not (myHrp and myHum and hrp) then
 				return "lost them"
 			end
-			-- stand 4 studs IN FRONT of them, looking at them. a smooth tween, never a snap.
-			local front = hrp.CFrame.Position + hrp.CFrame.LookVector * 4
+			-- LOCK the avatar: anchored (and no walking) for as long as we work on this person
+			myHrp.Anchored = true
+			myHum.WalkSpeed = 0
+			myHum.JumpPower = 0
+			pcall(function() myHum.JumpHeight = 0 end)
+
+			-- stand 5 studs IN FRONT of them, looking at them. a smooth tween, never a snap.
+			local front = hrp.CFrame.Position + hrp.CFrame.LookVector * 5
 			local goal = CFrame.lookAt(front, Vector3.new(hrp.Position.X, front.Y, hrp.Position.Z))
 			local dist = (myHrp.Position - front).Magnitude
-			if dist > 5 then
+			if dist > 2.5 then
 				B.setStatus(string.format("moving to %s", p.DisplayName))
 				myHrp.AssemblyLinearVelocity = Vector3.zero
 				local dur = math.clamp(dist / 110, 0.18, 1.1)
@@ -7122,6 +7168,38 @@ do
 			task.wait(tradeHot() and 0.1 or 0.3)
 		end
 		return "stopped"
+	end
+
+	-- always release the avatar when we are done with a person (also on stop / errors)
+	local function unlockAvatar()
+		pcall(function()
+			local hrp, hum = parts(LocalPlayer)
+			if hrp then
+				hrp.Anchored = false
+			end
+			if hum then
+				hum.WalkSpeed = B.savedWalk or 16
+				hum.JumpPower = B.savedJump or 50
+				pcall(function() hum.JumpHeight = B.savedHeight or 7.2 end)
+			end
+		end)
+	end
+
+	local function runTarget(p)
+		pcall(function()
+			local _, hum = parts(LocalPlayer)
+			if hum and hum.WalkSpeed > 0 then
+				B.savedWalk, B.savedJump = hum.WalkSpeed, hum.JumpPower
+				B.savedHeight = hum.JumpHeight
+			end
+		end)
+		local ok, res = pcall(runTargetInner, p)
+		unlockAvatar()
+		if not ok then
+			log("Beg: error - " .. tostring(res))
+			return "error"
+		end
+		return res
 	end
 
 	task.spawn(function()
