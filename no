@@ -4,19 +4,29 @@
 -- Accept / Confirm is pressed as soon as the other player puts items in (no waiting for them to accept first).
 -- OldPlaceIds saves every visited server with writefile(); WaitUntilPlayerHasLoaded reads it with readfile()
 --      and server-hops again if this server was already visited (long settle wait + double check before it acts).
--- SMART HOP: picks a fresh, not-yet-visited server from the public server list (falls back to plain matchmaking).
+-- HOP: plain TeleportService matchmaking only - NO Roblox web API / server list is ever called, so there are no API rate limits.
+-- SINGLE INSTANCE: a second copy of this script in the same server refuses to start.
 -- WindUI: press 9 to show / hide (mobile: WindUI's own open button).
 print("[tradeval] starting...")
 local __ok,__err=xpcall(function()
+local G=(type(getgenv)=="function" and getgenv()) or _G
+local prev=G.__tradeval_single
+if type(prev)=="table" and prev.on and prev.job==game.JobId and os.time()-(prev.beat or 0)<8 then
+	return warn("[tradeval] already running in this server - only one copy is loaded (press 9 to show the window).")
+end
+local single={on=true,job=game.JobId,beat=os.time()}   -- a stale entry (old server / dead copy) is simply replaced
+G.__tradeval_single=single
+task.spawn(function() while single.on do single.beat=os.time(); task.wait(1) end end)
+local function bail(m) single.on=false; return warn(m) end
 local Players,RS,HS,TeleS,TCS,RunS=game:GetService("Players"),game:GetService("ReplicatedStorage"),game:GetService("HttpService"),game:GetService("TeleportService"),game:GetService("TextChatService"),game:GetService("RunService")
 local LP=Players.LocalPlayer
 local PG=LP:WaitForChild("PlayerGui")
 local MY_NAME,MY_ID,VER=LP.Name,LP.UserId,"v17.0"
 local F_VAL,F_SET,F_SCRIPT,F_PLACES="mm2_trade_watcher_values.txt","mm2_trade_watcher_settings.json","mm2_trade_watcher_script.lua","mm2_trade_watcher_places.json"
 local Trade=RS:WaitForChild("Trade",20)
-if not Trade then return warn("[tradeval] Trade remotes missing - join a normal server and rerun.") end
+if not Trade then return bail("[tradeval] Trade remotes missing - join a normal server and rerun.") end
 local GTS=Trade:WaitForChild("GetTradeStatus",15)
-if not GTS then return warn("[tradeval] GetTradeStatus missing - rerun in a normal server.") end
+if not GTS then return bail("[tradeval] GetTradeStatus missing - rerun in a normal server.") end
 local alive,conns=true,{}
 local function track(c) conns[#conns+1]=c return c end
 
@@ -63,7 +73,7 @@ end
 ---------------------------------------------------------------- settings (saved as JSON in the executor workspace)
 local DEF={
 	matchFuzzy=false,matchSameRarity=true,matchThreshold=.6,autoAccept=false,
-	avoidRepeat=true,pauseInTrade=true,hopSmart=true,hopMinPlayers=4,visitWait=8,tpDist=200,
+	avoidRepeat=true,pauseInTrade=true,visitWait=8,tpDist=200,
 	hookOn=false,hookUrl="",
 	begHop=true,begHopTrade=true,begKeep=false,begWasOn=false,autoLoad=true,loadCmd="",begWait=60,begCool=60,
 	theme="Dark",
@@ -79,7 +89,7 @@ do
 		if d.matchVer~=2 then S.matchFuzzy=false end   -- older saves had closest matching on; switched off once
 		S.matchThreshold=math.clamp(S.matchThreshold,.4,.95)
 		S.begWait,S.begCool=math.clamp(S.begWait,10,300),math.clamp(S.begCool,10,300)
-		S.visitWait,S.hopMinPlayers=math.clamp(S.visitWait,3,30),math.clamp(S.hopMinPlayers,1,10)
+		S.visitWait=math.clamp(S.visitWait,3,30)
 		S.tpDist=math.clamp(S.tpDist,50,1000)
 		if S.begMsgs=="" then S.begMsgs=DEF.begMsgs end
 	end
@@ -907,65 +917,17 @@ do
 		while B.running and alive and os.clock()-t0<secs do B.setStatus(text); task.wait(.5) end
 	end
 
-	-- SMART HOP: reads the public server list (few, spaced-out requests, cached 60 s, backs off on 429), skips the current server,
-	-- every server saved in OldPlaceIds, servers that already failed, and servers that are empty / nearly full, then teleports straight to one.
-	-- No usable list (or smart hop off) -> plain Roblox matchmaking. 45-75 s between teleports, growing backoff after failures.
-	local Hop={busy=false,nextAt=0,fails=0,bad={},queued=false}
-	local Servers={at=-1e9,list={},blockedUntil=0}
-	local function httpGet(url)
-		local req=(syn and syn.request) or (http and http.request) or http_request or request
-		if type(req)=="function" then
-			local ok,res=pcall(req,{Url=url,Method="GET"})
-			if ok and type(res)=="table" then
-				local st=res.StatusCode or res.status_code or res.Status
-				if st==nil and res.Success then st=200 end
-				return st,res.Body or res.body
-			end
-		end
-		local ok,body=pcall(game.HttpGet,game,url)
-		if ok and type(body)=="string" then return 200,body end
-	end
-	local function fetchServers()
-		if os.clock()<Servers.blockedUntil then return nil,"server list cooling down" end
-		if #Servers.list>0 and os.clock()-Servers.at<60 then return Servers.list end
-		local out,cursor={},nil
-		for _=1,3 do
-			local url=string.format("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&excludeFullGames=true&limit=100%s",game.PlaceId,cursor and ("&cursor="..cursor) or "")
-			local st,body=httpGet(url)
-			if st==429 then Servers.blockedUntil=os.clock()+120+math.random()*60; return nil,"server list rate limited (429)" end
-			if type(body)~="string" then break end
-			local ok,d=pcall(function() return HS:JSONDecode(body) end)
-			if not (ok and type(d)=="table" and type(d.data)=="table") then break end
-			for _,sv in ipairs(d.data) do out[#out+1]=sv end
-			cursor=d.nextPageCursor
-			if type(cursor)~="string" then break end
-			task.wait(.7+math.random()*.7)
-		end
-		if #out==0 then return nil,"server list empty or unreachable" end
-		Servers.list,Servers.at=out,os.clock()
-		return out
-	end
-	local function pickServer()
-		local list,why=fetchServers(); if not list then return nil,why end
-		local visited={}
-		if TRACK_JOBID then for _,e in ipairs(OldPlaceIds.read()) do visited[e.key]=true end end
-		for _,minP in ipairs({S.hopMinPlayers,1}) do
-			local good={}
-			for _,sv in ipairs(list) do
-				local id=sv.id
-				if type(id)=="string" and id~=game.JobId and not Hop.bad[id] and not visited[OldPlaceIds.key(game.PlaceId,id)]
-					and type(sv.playing)=="number" and type(sv.maxPlayers)=="number"
-					and sv.playing>=minP and sv.playing<=sv.maxPlayers-2 then good[#good+1]=sv end
-			end
-			if #good>0 then return good[math.random(#good)] end
-		end
-		return nil,"no fresh server in the list"
-	end
-	pcall(function()   -- a teleport that fails later (full / gone server): blacklist is already set, allow a quick retry
+	-- RANDOM HOP with NO Roblox web API (no server list, no HTTP): TeleportService matchmaking picks the server, we only control the timing.
+	-- 45-75 s between teleports, growing random backoff after failures, longer backoff when Roblox answers "Flooded".
+	-- A server we already saw is caught by the visited check after loading (the script just hops again).
+	local Hop={busy=false,nextAt=0,fails=0,queued=false}
+	pcall(function()   -- a teleport can also fail later (full / flooded): back off, then allow the next try
 		track(TeleS.TeleportInitFailed:Connect(function(plr,result,msg)
 			if plr~=LP then return end
+			Hop.fails=Hop.fails+1
+			local flooded=(result==Enum.TeleportResult.Flooded)
+			Hop.nextAt=os.clock()+(flooded and (30+math.random()*30) or (6+math.random()*8))+math.min(Hop.fails*4,40)
 			log("Teleport failed: "..tostring(result).." "..tostring(msg))
-			Hop.nextAt=os.clock()+6+math.random()*8
 		end))
 	end)
 	local function hopRandom()
@@ -978,26 +940,15 @@ do
 			if not Hop.queued and S.autoLoad then log("Auto load: nothing queued (set a script URL / command in the BEG tab or save mm2_trade_watcher_script.lua)") end
 		end
 		task.wait(.25+math.random()*1.75)
-		local ok,why=false,"teleport failed"
-		if S.hopSmart then
-			local sv,e=pickServer()
-			if sv then
-				Hop.bad[sv.id]=true
-				ok=pcall(function() TeleS:TeleportToPlaceInstance(game.PlaceId,sv.id,LP) end)
-				why=ok and string.format("smart hop: server %s (%d/%d players)",sv.id:sub(1,8),sv.playing,sv.maxPlayers) or "teleport to the chosen server failed"
-			else log("Smart hop: "..tostring(e).." - using random matchmaking") end
-		end
+		local ok=pcall(function() TeleS:Teleport(game.PlaceId,LP) end)
+		local why=ok and "random server (matchmaking)" or "teleport failed"
 		if not ok then
-			ok=pcall(function() TeleS:Teleport(game.PlaceId,LP) end)
-			why=ok and "random server (matchmaking)" or "teleport failed"
-			if not ok then
-				task.wait(2+math.random()*4)
-				ok=pcall(function() TeleS:TeleportAsync(game.PlaceId,{LP}) end)
-				why=ok and "random server (async)" or "teleport failed"
-			end
+			task.wait(2+math.random()*4)
+			ok=pcall(function() TeleS:TeleportAsync(game.PlaceId,{LP}) end)
+			why=ok and "random server (async)" or "teleport failed"
 		end
 		if ok then
-			Hop.fails=0; B.hops=B.hops+1
+			B.hops=B.hops+1
 		else
 			Hop.fails=Hop.fails+1
 			local wait=math.ceil(math.min(30+15*Hop.fails,150)+math.random()*30)
@@ -1272,7 +1223,7 @@ end
 
 ---------------------------------------------------------------- WindUI
 local okUI,WindUI=pcall(function() return loadstring(game:HttpGet("https://github.com/Footagesus/WindUI/releases/latest/download/main.lua"))() end)
-if not okUI or type(WindUI)~="table" then return warn("[tradeval] WindUI failed to load: "..tostring(WindUI)) end
+if not okUI or type(WindUI)~="table" then return bail("[tradeval] WindUI failed to load: "..tostring(WindUI)) end
 local THEMES={"Dark","Light","Rose","Plant","Red","Indigo","Sky","Violet","Amber","Emerald"}
 if not table.find(THEMES,S.theme) then S.theme="Dark" end
 local Win=WindUI:CreateWindow({Title="tradeval "..VER,Icon="repeat",Author="MM2 trade value watcher",Folder="tradeval",Size=UDim2.fromOffset(580,460),Theme=S.theme})
@@ -1328,6 +1279,7 @@ TC:Dropdown({Title="Theme",Values=THEMES,Value=S.theme,Callback=function(o)
 end})
 TC:Button({Title="Unload tradeval",Callback=function()
 	alive=false; B.running=false; S.begWasOn=false; save()
+	single.on=false; if G.__tradeval_single==single then G.__tradeval_single=nil end
 	if B.unlock then B.unlock() end
 	for _,c in ipairs(conns) do pcall(function() c:Disconnect() end) end
 	table.clear(conns)
@@ -1352,8 +1304,6 @@ slider(TB,"Wait after a trade (seconds)",10,300,"begCool",1)
 slider(TB,"Instant teleport when farther than (studs)",50,1000,"tpDist",1)
 TB:Section({Title="Server hop"})
 toggle(TB,"Hop to a new server after one accepted trade","begHopTrade")
-toggle(TB,"Smart hop (pick a fresh server from the server list)","hopSmart",nil,"Skips visited / failed / empty / nearly full servers. Falls back to random matchmaking if the list is unavailable.")
-slider(TB,"Smart hop: min players in the target server",1,10,"hopMinPlayers",1)
 toggle(TB,"Hop when everyone here was asked","begHop")
 toggle(TB,"Keep BEG on between hops","begKeep")
 toggle(TB,"Auto load script in the next server","autoLoad")
@@ -1414,4 +1364,7 @@ end)
 print("[tradeval] loaded OK - press 9 to show / hide the window")
 return
 end,function(e) return tostring(e).."\n"..debug.traceback() end)
-if not __ok then warn("[tradeval] FAILED TO LOAD:\n"..tostring(__err)) end
+if not __ok then
+	warn("[tradeval] FAILED TO LOAD:\n"..tostring(__err))
+	pcall(function() local g=(type(getgenv)=="function" and getgenv()) or _G; if g.__tradeval_single then g.__tradeval_single.on=false end end)
+end
