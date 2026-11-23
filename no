@@ -63,7 +63,7 @@ end
 ---------------------------------------------------------------- settings (saved as JSON in the executor workspace)
 local DEF={
 	matchFuzzy=false,matchSameRarity=true,matchThreshold=.6,autoAccept=false,
-	avoidRepeat=true,pauseInTrade=true,hopSmart=true,hopMinPlayers=4,visitWait=8,
+	avoidRepeat=true,pauseInTrade=true,hopSmart=true,hopMinPlayers=4,visitWait=8,tpDist=200,
 	hookOn=false,hookUrl="",
 	begHop=true,begHopTrade=true,begKeep=false,begWasOn=false,autoLoad=true,loadCmd="",begWait=60,begCool=60,
 	theme="Dark",
@@ -80,6 +80,7 @@ do
 		S.matchThreshold=math.clamp(S.matchThreshold,.4,.95)
 		S.begWait,S.begCool=math.clamp(S.begWait,10,300),math.clamp(S.begCool,10,300)
 		S.visitWait,S.hopMinPlayers=math.clamp(S.visitWait,3,30),math.clamp(S.hopMinPlayers,1,10)
+		S.tpDist=math.clamp(S.tpDist,50,1000)
 		if S.begMsgs=="" then S.begMsgs=DEF.begMsgs end
 	end
 end
@@ -1126,9 +1127,19 @@ do
 			local my,hum=parts(LP); local hrp=parts(p)
 			if not (my and hum and hrp) then return "lost them" end
 			my.Anchored=true; hum.WalkSpeed=0; hum.JumpPower=0; pcall(function() hum.JumpHeight=0 end)
-			if (my.Position-frontGoal(hrp)).Magnitude>1.5 then
-				B.setStatus("moving to "..p.DisplayName); glide(my,p,3)
-				if os.clock()-startT>30 and not arrivedT then return "could not reach" end
+			local gp,fd=frontGoal(hrp)
+			local dist=(my.Position-gp).Magnitude
+			if dist>1.5 then
+				if dist>S.tpDist then   -- far away: teleport straight in front of them, no matter where they are
+					B.setStatus(string.format("teleporting to %s (%d studs away)",p.DisplayName,math.floor(dist)))
+					pcall(function()
+						my.CFrame=CFrame.lookAt(gp,gp+(fd.Magnitude>.01 and fd or my.CFrame.LookVector))
+						my.AssemblyLinearVelocity=Vector3.zero
+					end)
+					task.wait(.1)
+				else   -- close: smooth glide (re-evaluated every 3 s while they move)
+					B.setStatus("moving to "..p.DisplayName); glide(my,p,3)
+				end
 			else
 				arrivedT=arrivedT or os.clock()
 				pcall(function() my.CFrame=my.CFrame:Lerp(CFrame.lookAt(my.Position,Vector3.new(hrp.Position.X,my.Position.Y,hrp.Position.Z)),.45) end)
@@ -1338,6 +1349,7 @@ TB:Input({Title="Beg messages (separate with  |  - a random one is sent)",Value=
 end})
 slider(TB,"Wait for a trade (seconds)",10,300,"begWait",1)
 slider(TB,"Wait after a trade (seconds)",10,300,"begCool",1)
+slider(TB,"Instant teleport when farther than (studs)",50,1000,"tpDist",1)
 TB:Section({Title="Server hop"})
 toggle(TB,"Hop to a new server after one accepted trade","begHopTrade")
 toggle(TB,"Smart hop (pick a fresh server from the server list)","hopSmart",nil,"Skips visited / failed / empty / nearly full servers. Falls back to random matchmaking if the list is unavailable.")
