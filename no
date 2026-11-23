@@ -1,8 +1,8 @@
 -- tradeval v17.0 (WindUI edition) - MM2 trade value watcher
 -- GUI: https://github.com/Footagesus/WindUI   |   settings: mm2_trade_watcher_settings.json
 -- VALUES import | CONFIG | BEG bot | VISITED servers checklist
--- NEW: accepts a trade ONLY after the other player has accepted (toggle in Config / Beg).
--- NEW: OldPlaceIds saves every visited server with writefile(); WaitUntilPlayerHasLoaded reads it with readfile()
+-- Accept / Confirm is pressed as soon as the other player puts items in (no waiting for them to accept first).
+-- OldPlaceIds saves every visited server with writefile(); WaitUntilPlayerHasLoaded reads it with readfile()
 --      and server-hops again if this server was already visited.
 -- WindUI: press 9 to show / hide (mobile: WindUI's own open button).
 print("[tradeval] starting...")
@@ -62,7 +62,7 @@ end
 ---------------------------------------------------------------- settings (saved as JSON in the executor workspace)
 local DEF={
 	matchFuzzy=false,matchSameRarity=true,matchThreshold=.6,autoAccept=false,
-	onlyIfTheyAccept=true,avoidRepeat=true,pauseInTrade=true,
+	avoidRepeat=true,pauseInTrade=true,
 	hookOn=false,hookUrl="",
 	begHop=true,begHopTrade=true,begKeep=false,begWasOn=false,autoLoad=true,loadCmd="",begWait=60,begCool=60,
 	theme="Dark",
@@ -403,7 +403,7 @@ end
 local HOOKS={"https://discord.com/api/webhooks/","https://discordapp.com/api/webhooks/","https://ptb.discord.com/api/webhooks/","https://canary.discord.com/api/webhooks/"}
 local function hookValid(u) u=trim(u) for _,p in ipairs(HOOKS) do if u:sub(1,#p)==p and #u>#p+10 then return true end end return false end
 local hookBusy,hookLast=false,-1e9
-local function sendHook(ttl,detail,color,noPing)   -- pings @everyone unless noPing
+local function sendHook(ttl,detail,color)   -- always pings @everyone
 	if not S.hookOn then return false,"webhook off" end
 	local url=trim(S.hookUrl)
 	if not hookValid(url) then return false,"no webhook url" end
@@ -414,7 +414,7 @@ local function sendHook(ttl,detail,color,noPing)   -- pings @everyone unless noP
 	hookBusy,hookLast=true,os.clock()
 	task.spawn(function()
 		local ok,body=pcall(function()
-			return HS:JSONEncode({username="tradeval",content=noPing and "" or "@everyone",allowed_mentions={parse=noPing and {} or {"everyone"}},
+			return HS:JSONEncode({username="tradeval",content="@everyone",allowed_mentions={parse={"everyone"}},
 				embeds={{title=tostring(ttl),description=tostring(detail),color=color or 15158332,footer={text=MY_NAME.."  ·  "..VER},timestamp=DateTime.now():ToIsoDate()}}})
 		end)
 		if ok then pcall(req,{Url=url,Method="POST",Headers={["Content-Type"]="application/json"},Body=body}) end
@@ -871,24 +871,18 @@ do
 		end
 		return false
 	end
-	-- Accept -> Confirm. With "only accept if they do" ON, nothing is pressed until THEIR side shows Accepted.
-	-- returns pressed?, newest list of their items
+	-- Accept -> Confirm, re-pressed every 0.5 s while they still change the offer. returns pressed?, newest list of their items
 	local function acceptSequence()
-		B.setStatus("trade open - waiting for them to accept")
+		B.setStatus("trade open - accepting")
 		local fires,lastFire,t0,lastList=0,0,os.clock(),{}
 		while B.running and alive and os.clock()-t0<40 do
 			local sd=peekTrade(); if not sd then break end
 			local cur=decodeOffer(sd.theirs)
 			if #cur>0 then lastList=cur end
-			local theyOk=(not S.onlyIfTheyAccept) or sd.theirAccepted==true
 			if #cur>0 and fires<60 then
-				if theyOk then
-					local conf=confirmShown(acceptRoot())
-					if (fires==0 or os.clock()-lastFire>=.5) and fireAccept() then
-						fires=fires+1; lastFire=os.clock(); B.setStatus(conf and "they accepted - pressed Confirm" or "they accepted - pressed Accept")
-					end
-				else
-					B.setStatus("trade open - waiting for them to accept")
+				local conf=confirmShown(acceptRoot())
+				if (fires==0 or os.clock()-lastFire>=.5) and fireAccept() then
+					fires=fires+1; lastFire=os.clock(); B.setStatus(conf and "pressed Confirm" or "pressed Accept")
 				end
 			end
 			task.wait(.12)
@@ -928,7 +922,6 @@ do
 		end
 		if ok then
 			Hop.fails=0; B.hops=B.hops+1
-			sendHook("Server hop",string.format("Moved to a new random server.\nAccount: **%s**\nHops this session: **%d**",MY_NAME,B.hops),3899126,true)
 		else
 			Hop.fails=Hop.fails+1
 			why=why..string.format(" - retrying in %d s",math.ceil(math.min(30+15*Hop.fails,150)+math.random()*30))
@@ -1203,15 +1196,13 @@ toggle(TC,"Same rarity only","matchSameRarity",refreshAll)
 slider(TC,"Match strength % (closest only)",40,95,"matchThreshold",100,refreshAll)
 TC:Section({Title="Trades"})
 toggle(TC,"Auto-accept incoming trade requests","autoAccept",function(v) log("Auto-accept trades "..(v and "ON" or "OFF")) end)
-toggle(TC,"Only accept a trade after THEY accept","onlyIfTheyAccept",function(v) log("Only accept after they accept: "..(v and "ON" or "OFF")) end,
-	"Accept / Confirm is never pressed until the other player's side shows Accepted.")
 TC:Section({Title="Discord webhook"})
 TC:Input({Title="Webhook URL",Value=S.hookUrl,Placeholder="https://discord.com/api/webhooks/...",Callback=function(t)
 	S.hookUrl=trim(t)
 	if not hookValid(S.hookUrl) then S.hookOn=false; notify("Webhook","not a webhook url") else notify("Webhook","url saved") end
 	save()
 end})
-toggle(TC,"Send hop + accepted-trade messages","hookOn")
+toggle(TC,"Send accepted-trade messages","hookOn")
 TC:Button({Title="TEST webhook",Callback=function()
 	local ok,why=sendHook("tradeval test",string.format("Webhook is working.\nAccount: **%s**\nPlace: %d",MY_NAME,game.PlaceId),3899126)
 	log("Webhook test: "..tostring(why)); notify("Webhook test",ok and "test message sent" or tostring(why))
@@ -1236,7 +1227,6 @@ begToggle=TB:Toggle({Title="Begging bot",Value=false,Callback=function(v)
 	B.running=v; S.begWasOn=v; save()
 	if v then B.done={}; B.setStatus("starting...") else B.setStatus("stopped"); B.target=nil; if B.unlock then B.unlock() end end
 end})
-toggle(TB,"Only accept a trade after THEY accept","onlyIfTheyAccept")
 toggle(TB,"Pause begging while in a trade","pauseInTrade",nil,"No messages, walking or server hops while a trade is open.")
 TB:Section({Title="Messages"})
 TB:Input({Title="Beg messages (separate with  |  - a random one is sent)",Value=(S.begMsgs:gsub("[\r\n]+","|")),Placeholder="msg one|msg two|...",Callback=function(t)
