@@ -852,14 +852,16 @@ do
 	-- everyone who is still to be asked, nearest first (the same order pickTarget uses). returns list (max n), total
 	function B.queue(n)
 		local my=parts(LP); local out={}
-		if not my then return out,0 end
+		if my then B.lastPos=my.Position end
+		local origin=my and my.Position or B.lastPos
 		for _,p in ipairs(Players:GetPlayers()) do
 			if p~=LP and not B.done[p.UserId] then
 				local h=parts(p)
-				if h then out[#out+1]={plr=p,dist=(h.Position-my.Position).Magnitude} end
+				local d=(h and origin) and (h.Position-origin).Magnitude or nil
+				if h or p.Parent then out[#out+1]={plr=p,dist=d} end
 			end
 		end
-		table.sort(out,function(a,b) return a.dist<b.dist end)
+		table.sort(out,function(a,b) return (a.dist or 1e9)<(b.dist or 1e9) end)
 		local total=#out
 		while n and #out>n do table.remove(out) end
 		return out,total
@@ -1356,10 +1358,11 @@ local function queueText()
 	L[#L+1]=""
 	local q,total=B.queue(5)
 	if #q==0 then
-		L[#L+1]=g.."nobody left to ask in this server</font>"
+		if #Players:GetPlayers()<=1 then L[#L+1]=g.."nobody else is in this server</font>"
+		else L[#L+1]=g.."everyone here was already asked</font>" end
 	else
 		L[#L+1]="<b>NEXT:</b>"
-		for i,e in ipairs(q) do L[#L+1]=string.format("%d. %s  %s%d studs</font>",i,esc(e.plr.DisplayName),g,math.floor(e.dist)) end
+		for i,e in ipairs(q) do L[#L+1]=string.format("%d. %s  %s%s</font>",i,esc(e.plr.DisplayName),g,e.dist and (math.floor(e.dist).." studs") or "loading...") end
 		if total>#q then L[#L+1]=string.format("%s+ %d more</font>",g,total-#q) end
 	end
 	L[#L+1]=""
@@ -1367,10 +1370,15 @@ local function queueText()
 	return table.concat(L,"\n")
 end
 local function setQueueVisible(v) if Q.gui then Q.gui.Enabled=v end end
+S.showQueue=true   -- the Next-up window is ON by default every time the script loads (toggle it in the Beg tab)
 if not pcall(buildQueue) then log("Next-up window could not be created") end
 task.spawn(function()
 	while alive do
-		if Q.gui and Q.gui.Enabled then pcall(function() Q.body.Text=queueText() end) end
+		if S.showQueue and (not Q.gui or not Q.gui.Parent) then pcall(buildQueue) end   -- self-heal if it got destroyed
+		if Q.gui and Q.gui.Parent then
+			if Q.gui.Enabled~=S.showQueue then Q.gui.Enabled=S.showQueue end
+			if Q.gui.Enabled then pcall(function() Q.body.Text=queueText() end) end
+		end
 		task.wait(.5)
 	end
 end)
@@ -1489,6 +1497,7 @@ do
 	local function onChar(ch)
 		B.charGen=B.charGen+1
 		B.readyAt=os.clock()+2          -- let the new character settle before the bot acts again
+		B.target=nil; B.lastPos=nil
 		pcall(refreshVisited)           -- refresh the visited list
 		pcall(preview)                  -- refresh the values list
 		local hum=ch:WaitForChild("Humanoid",10)
