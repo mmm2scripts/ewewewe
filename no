@@ -4,6 +4,7 @@
 -- Accept / Confirm is pressed as soon as the other player puts items in (no waiting for them to accept first).
 -- OldPlaceIds saves every visited server with writefile(); WaitUntilPlayerHasLoaded reads it with readfile()
 --      and server-hops again if this server was already visited (long settle wait + double check before it acts).
+-- NEXT UP: a separate draggable window (own ScreenGui) shows who is being asked now and who is next.
 -- HOP: plain TeleportService matchmaking only - NO Roblox web API / server list is ever called, so there are no API rate limits.
 -- SINGLE INSTANCE: a second copy of this script in the same server refuses to start.
 -- WindUI: press 9 to show / hide (mobile: WindUI's own open button).
@@ -73,7 +74,7 @@ end
 ---------------------------------------------------------------- settings (saved as JSON in the executor workspace)
 local DEF={
 	matchFuzzy=false,matchSameRarity=true,matchThreshold=.6,autoAccept=false,
-	avoidRepeat=true,pauseInTrade=true,visitWait=8,tpDist=200,
+	avoidRepeat=true,pauseInTrade=true,visitWait=8,tpDist=200,showQueue=true,
 	hookOn=false,hookUrl="",
 	begHop=true,begHopTrade=true,begKeep=false,begWasOn=false,autoLoad=true,loadCmd="",begWait=60,begCool=60,
 	theme="Dark",
@@ -812,6 +813,22 @@ do
 		return best
 	end
 
+	-- everyone who is still to be asked, nearest first (the same order pickTarget uses). returns list (max n), total
+	function B.queue(n)
+		local my=parts(LP); local out={}
+		if not my then return out,0 end
+		for _,p in ipairs(Players:GetPlayers()) do
+			if p~=LP and not B.done[p.UserId] then
+				local h=parts(p)
+				if h then out[#out+1]={plr=p,dist=(h.Position-my.Position).Magnitude} end
+			end
+		end
+		table.sort(out,function(a,b) return a.dist<b.dist end)
+		local total=#out
+		while n and #out>n do table.remove(out) end
+		return out,total
+	end
+
 	-- "a trade is opening" signal: trade GUI showing or a Trade remote event in the last 3 s (loops poll faster while hot)
 	local function tradeHot()
 		if os.clock()-B.lastEvt<3 then return true end
@@ -1238,6 +1255,77 @@ local function slider(t,name,lo,hi,key,scale,after)
 		S[key]=v/scale; debounce("save",.8,save); if after then debounce("after",.4,after) end end})
 end
 
+---------------------------------------------------------------- separate "NEXT UP" window (own ScreenGui, draggable, not part of WindUI)
+local UIS=game:GetService("UserInputService")
+local Q={}
+local function esc(t) return (tostring(t):gsub("&","&amp;"):gsub("<","&lt;"):gsub(">","&gt;")) end
+local function buildQueue()
+	local sg=Instance.new("ScreenGui")
+	sg.Name="tradeval_nextup"; sg.ResetOnSpawn=false; sg.DisplayOrder=100; sg.Enabled=S.showQueue
+	pcall(function() if syn and syn.protect_gui then syn.protect_gui(sg) end end)
+	local ok=pcall(function() sg.Parent=(type(gethui)=="function" and gethui()) or game:GetService("CoreGui") end)
+	if not ok or not sg.Parent then sg.Parent=PG end
+	local fr=Instance.new("Frame")
+	fr.Name="Main"; fr.AutomaticSize=Enum.AutomaticSize.Y; fr.Size=UDim2.fromOffset(250,0); fr.Position=UDim2.new(1,-270,.3,0)
+	fr.BackgroundColor3=Color3.fromRGB(18,18,24); fr.BackgroundTransparency=.08; fr.BorderSizePixel=0; fr.Active=true; fr.Parent=sg
+	local cr=Instance.new("UICorner"); cr.CornerRadius=UDim.new(0,10); cr.Parent=fr
+	local st=Instance.new("UIStroke"); st.Color=Color3.fromRGB(70,70,90); st.Thickness=1; st.Parent=fr
+	local pad=Instance.new("UIPadding"); pad.PaddingBottom=UDim.new(0,10); pad.Parent=fr
+	local bar=Instance.new("TextLabel")
+	bar.Size=UDim2.new(1,0,0,28); bar.BackgroundTransparency=1; bar.Text="  NEXT UP  ·  drag to move"; bar.Font=Enum.Font.GothamBold; bar.TextSize=13
+	bar.TextColor3=Color3.fromRGB(235,235,245); bar.TextXAlignment=Enum.TextXAlignment.Left; bar.Active=true; bar.Parent=fr
+	local body=Instance.new("TextLabel")
+	body.Position=UDim2.fromOffset(10,32); body.Size=UDim2.new(1,-20,0,0); body.AutomaticSize=Enum.AutomaticSize.Y; body.BackgroundTransparency=1
+	body.Font=Enum.Font.Gotham; body.TextSize=14; body.RichText=true; body.TextWrapped=true; body.TextXAlignment=Enum.TextXAlignment.Left
+	body.TextYAlignment=Enum.TextYAlignment.Top; body.TextColor3=Color3.fromRGB(220,220,230); body.Text="..."; body.Parent=fr
+	local dragging,ds,sp=false,nil,nil
+	track(bar.InputBegan:Connect(function(i)
+		if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then dragging,ds,sp=true,i.Position,fr.Position end
+	end))
+	track(UIS.InputChanged:Connect(function(i)
+		if dragging and (i.UserInputType==Enum.UserInputType.MouseMovement or i.UserInputType==Enum.UserInputType.Touch) then
+			local d=i.Position-ds
+			fr.Position=UDim2.new(sp.X.Scale,sp.X.Offset+d.X,sp.Y.Scale,sp.Y.Offset+d.Y)
+		end
+	end))
+	track(UIS.InputEnded:Connect(function(i)
+		if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then dragging=false end
+	end))
+	Q.gui,Q.body=sg,body
+end
+local function queueText()
+	local g='<font color="#9aa0b4">'
+	local L={}
+	L[#L+1]=B.running and '<font color="#5cd65c"><b>BEG RUNNING</b></font>' or '<font color="#d65c5c"><b>BEG STOPPED</b></font>'
+	local t=B.target
+	if t then
+		L[#L+1]=string.format("<b>NOW:</b> %s %s(@%s)</font>",esc(t.DisplayName),g,esc(t.Name))
+		L[#L+1]=g..esc(B.status).."</font>"
+	else
+		L[#L+1]="<b>NOW:</b> "..g.."nobody</font>"
+	end
+	L[#L+1]=""
+	local q,total=B.queue(5)
+	if #q==0 then
+		L[#L+1]=g.."nobody left to ask in this server</font>"
+	else
+		L[#L+1]="<b>NEXT:</b>"
+		for i,e in ipairs(q) do L[#L+1]=string.format("%d. %s  %s%d studs</font>",i,esc(e.plr.DisplayName),g,math.floor(e.dist)) end
+		if total>#q then L[#L+1]=string.format("%s+ %d more</font>",g,total-#q) end
+	end
+	L[#L+1]=""
+	L[#L+1]=string.format("%sasked %d  ·  accepted %d  ·  hops %d</font>",g,B.asked,B.accepted,B.hops)
+	return table.concat(L,"\n")
+end
+local function setQueueVisible(v) if Q.gui then Q.gui.Enabled=v end end
+if not pcall(buildQueue) then log("Next-up window could not be created") end
+task.spawn(function()
+	while alive do
+		if Q.gui and Q.gui.Enabled then pcall(function() Q.body.Text=queueText() end) end
+		task.wait(.5)
+	end
+end)
+
 -- VALUES
 local TV=tab("Values","list")
 U.valStatus=TV:Paragraph({Title="VALUES  ·  none loaded",Desc="no values loaded - import mm2values.txt / .csv"})
@@ -1280,6 +1368,7 @@ end})
 TC:Button({Title="Unload tradeval",Callback=function()
 	alive=false; B.running=false; S.begWasOn=false; save()
 	single.on=false; if G.__tradeval_single==single then G.__tradeval_single=nil end
+	pcall(function() if Q.gui then Q.gui:Destroy() end end)
 	if B.unlock then B.unlock() end
 	for _,c in ipairs(conns) do pcall(function() c:Disconnect() end) end
 	table.clear(conns)
@@ -1295,6 +1384,7 @@ begToggle=TB:Toggle({Title="Begging bot",Value=false,Callback=function(v)
 	if v then B.done={}; B.setStatus("starting...") else B.setStatus("stopped"); B.target=nil; if B.unlock then B.unlock() end end
 end})
 toggle(TB,"Pause begging while in a trade","pauseInTrade",nil,"No messages, walking or server hops while a trade is open.")
+toggle(TB,"Show the 'Next up' window","showQueue",setQueueVisible,"Separate draggable window: who is being asked now and who is next.")
 TB:Section({Title="Messages"})
 TB:Input({Title="Beg messages (separate with  |  - a random one is sent)",Value=(S.begMsgs:gsub("[\r\n]+","|")),Placeholder="msg one|msg two|...",Callback=function(t)
 	S.begMsgs=t; debounce("save",.2,save)
