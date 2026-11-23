@@ -1,6 +1,7 @@
--- tradeval v17.0 (WindUI edition) - MM2 trade value watcher
+-- tradeval v17.1 (WindUI edition) - MM2 trade value watcher
 -- GUI: https://github.com/Footagesus/WindUI   |   settings: mm2_trade_watcher_settings.json
 -- VALUES import | CONFIG | BEG bot | VISITED servers checklist
+-- v17.1: dying / resetting no longer breaks the beg bot (target is cancelled, bot waits for the respawn, lists refresh).
 -- Accept / Confirm is pressed as soon as the other player puts items in (no waiting for them to accept first).
 -- OldPlaceIds saves every visited server with writefile(); WaitUntilPlayerHasLoaded reads it with readfile()
 --      and server-hops again if this server was already visited (long settle wait + double check before it acts).
@@ -22,7 +23,7 @@ local function bail(m) single.on=false; return warn(m) end
 local Players,RS,HS,TeleS,TCS,RunS=game:GetService("Players"),game:GetService("ReplicatedStorage"),game:GetService("HttpService"),game:GetService("TeleportService"),game:GetService("TextChatService"),game:GetService("RunService")
 local LP=Players.LocalPlayer
 local PG=LP:WaitForChild("PlayerGui")
-local MY_NAME,MY_ID,VER=LP.Name,LP.UserId,"v17.0"
+local MY_NAME,MY_ID,VER=LP.Name,LP.UserId,"v17.1"
 local F_VAL,F_SET,F_SCRIPT,F_PLACES="mm2_trade_watcher_values.txt","mm2_trade_watcher_settings.json","mm2_trade_watcher_script.lua","mm2_trade_watcher_places.json"
 local Trade=RS:WaitForChild("Trade",20)
 if not Trade then return bail("[tradeval] Trade remotes missing - join a normal server and rerun.") end
@@ -76,7 +77,7 @@ local DEF={
 	matchFuzzy=false,matchSameRarity=true,matchThreshold=.6,autoAccept=false,
 	avoidRepeat=true,pauseInTrade=true,visitWait=8,tpDist=200,showQueue=true,
 	hookOn=false,hookUrl="",
-	begHop=true,begHopTrade=true,begKeep=false,begWasOn=false,autoLoad=true,loadCmd="",begWait=60,begCool=60,
+	begHop=true,begHopTrade=true,begKeep=false,begWasOn=false,begStopOnDeath=false,autoLoad=true,loadCmd="",begWait=60,begCool=60,
 	theme="Dark",
 	begMsgs="hey 🥺 I'm just trying to build my collection, even a tiny free weapon would make my whole day ❤️|a little kindness goes a long way 🥺 could you spare a small free weapon? ❤️|I'd be so thankful for any weapon, even a basic one, it would really make me smile 😊|pls could you gift me a free weapon? I'll appreciate it so much 🥺❤️|you seem like a kind person 🥺 would you share a free weapon with me?|any small weapon works, a little kindness would make my day 🙏❤️|I'm trying my best to build up my collection 🥺 a free weapon from you would mean a lot|thank you in advance for being so kind ❤️ could I have a free weapon pls?",
 }
@@ -743,7 +744,8 @@ local function refreshVisited()
 end
 
 ---------------------------------------------------------------- auto-accept incoming trade requests + BEG bot
-local B={running=false,asked=0,accepted=0,hops=0,done={},target=nil,status="stopped",lastEvt=-1e9}
+-- charGen goes up every time your character spawns or dies; readyAt = earliest time the bot may act after a respawn
+local B={running=false,asked=0,accepted=0,hops=0,done={},target=nil,status="stopped",lastEvt=-1e9,charGen=0,readyAt=0}
 function B.setStatus(t) B.status=tostring(t) end
 function B.inTrade() return false end   -- replaced below once the trade reader exists
 do
@@ -834,6 +836,7 @@ do
 		local hrp,hum=c:FindFirstChild("HumanoidRootPart"),c:FindFirstChildOfClass("Humanoid")
 		if hrp and hum and hum.Health>0 then return hrp,hum end
 	end
+	B.parts=parts   -- exposed so the Next-up window can tell when you are dead / respawning
 	local function pickTarget()
 		local my=parts(LP); if not my then return nil end
 		local best,bd=nil,math.huge
@@ -1066,6 +1069,7 @@ do
 
 	local function runTargetInner(p)
 		B.target=p
+		local gen=B.charGen   -- if this changes, you died / reset: the target is cancelled
 		local msgs=messages()
 		local startT,arrivedT=os.clock(),nil
 		local asked,tries,wasOpen,declines=false,0,false,0   -- ONE message per person
@@ -1075,6 +1079,7 @@ do
 			if ok and m and rep and not rep.guiOnly and not acceptT then base=m end
 		end)
 		while B.running and alive do
+			if B.charGen~=gen or not parts(LP) then return "respawned" end
 			if not p.Parent then return "left the game" end
 			local sd=peekTrade()
 			-- 0) one message for THIS person (retried only if sending itself failed, max 3; never while a trade is open)
@@ -1126,7 +1131,8 @@ do
 			end
 			-- 2) walk to / follow them (avatar anchored while we work on this person)
 			local my,hum=parts(LP); local hrp=parts(p)
-			if not (my and hum and hrp) then return "lost them" end
+			if not (my and hum) then return "respawned" end
+			if not hrp then return "lost them" end
 			my.Anchored=true; hum.WalkSpeed=0; hum.JumpPower=0; pcall(function() hum.JumpHeight=0 end)
 			local gp,fd=frontGoal(hrp)
 			local dist=(my.Position-gp).Magnitude
@@ -1177,30 +1183,39 @@ do
 		while alive do
 			task.wait(.5)
 			if B.running then
-				local p=pickTarget()
-				if p then
-					noneSince=nil; B.done[p.UserId]=true; B.asked=B.asked+1
-					local why=runTarget(p)
-					log("Beg: finished with "..p.Name.." ("..tostring(why)..")"); B.target=nil
-					if why=="traded" and S.begHopTrade then   -- one trade done: leave for a new random server (retry until the teleport starts)
-						while B.running and alive do
-							B.setStatus("trade done - hopping to a new server...")
-							local ok,hw=hopRandom(); log("Hop after trade: "..tostring(hw))
-							if ok then noneSince=nil; task.wait(5) break end
-							sleepStatus("hop: "..tostring(hw),5+math.random()*10)
-						end
-					end
+				if not parts(LP) or os.clock()<B.readyAt then
+					-- you are dead / respawning: do nothing, do not hop, do not burn the queue
+					B.setStatus("waiting for your character to respawn...")
+					noneSince=nil
 				else
-					noneSince=noneSince or os.clock()
-					if next(B.done) and S.begHop then   -- everyone here was asked once: new random server
-						B.setStatus("everyone asked - hopping to a new server...")
-						local ok,hw=hopRandom(); log("Hop (everyone asked): "..tostring(hw))
-						if ok then noneSince=nil; task.wait(5) else sleepStatus("hop: "..tostring(hw),5+math.random()*10) end
+					local p=pickTarget()
+					if p then
+						noneSince=nil; B.done[p.UserId]=true; B.asked=B.asked+1
+						local why=runTarget(p)
+						log("Beg: finished with "..p.Name.." ("..tostring(why)..")"); B.target=nil
+						if why=="respawned" then   -- you died / reset: give this person another chance
+							B.done[p.UserId]=nil; B.asked=math.max(0,B.asked-1)
+						end
+						if why=="traded" and S.begHopTrade then   -- one trade done: leave for a new random server (retry until the teleport starts)
+							while B.running and alive do
+								B.setStatus("trade done - hopping to a new server...")
+								local ok,hw=hopRandom(); log("Hop after trade: "..tostring(hw))
+								if ok then noneSince=nil; task.wait(5) break end
+								sleepStatus("hop: "..tostring(hw),5+math.random()*10)
+							end
+						end
 					else
-						B.setStatus("no one to ask - looking again")
-						if os.clock()-noneSince>120 and next(B.done) then B.done={}; noneSince=nil end   -- HOP off: restart only after a long quiet minute
+						noneSince=noneSince or os.clock()
+						if next(B.done) and S.begHop then   -- everyone here was asked once: new random server
+							B.setStatus("everyone asked - hopping to a new server...")
+							local ok,hw=hopRandom(); log("Hop (everyone asked): "..tostring(hw))
+							if ok then noneSince=nil; task.wait(5) else sleepStatus("hop: "..tostring(hw),5+math.random()*10) end
+						else
+							B.setStatus("no one to ask - looking again")
+							if os.clock()-noneSince>120 and next(B.done) then B.done={}; noneSince=nil end   -- HOP off: restart only after a long quiet minute
+						end
+						task.wait(4)
 					end
-					task.wait(4)
 				end
 			end
 		end
@@ -1330,6 +1345,7 @@ local function queueText()
 	local g='<font color="#9aa0b4">'
 	local L={}
 	L[#L+1]=B.running and '<font color="#5cd65c"><b>BEG RUNNING</b></font>' or '<font color="#d65c5c"><b>BEG STOPPED</b></font>'
+	if not B.parts(LP) then L[#L+1]=g.."you are respawning...</font>" end
 	local t=B.target
 	if t then
 		L[#L+1]=string.format("<b>NOW:</b> %s %s(@%s)</font>",esc(t.DisplayName),g,esc(t.Name))
@@ -1417,6 +1433,7 @@ begToggle=TB:Toggle({Title="Begging bot",Value=false,Callback=function(v)
 	if v then B.done={}; B.setStatus("starting...") else B.setStatus("stopped"); B.target=nil; if B.unlock then B.unlock() end end
 end})
 toggle(TB,"Pause begging while in a trade","pauseInTrade",nil,"No messages, walking or server hops while a trade is open.")
+toggle(TB,"Stop begging when I die / reset","begStopOnDeath",nil,"Off = the bot pauses, waits for the respawn and continues.")
 toggle(TB,"Show the 'Next up' window","showQueue",setQueueVisible,"Separate draggable window: who is being asked now and who is next.")
 TB:Section({Title="Messages"})
 TB:Input({Title="Beg messages (separate with  |  - a random one is sent)",Value=(S.begMsgs:gsub("[\r\n]+","|")),Placeholder="msg one|msg two|...",Callback=function(t)
@@ -1465,6 +1482,30 @@ do
 	local function hook(r) if r:IsA("RemoteEvent") then track(r.OnClientEvent:Connect(function() B.lastEvt=os.clock() end)) end end
 	for _,c in ipairs(Trade:GetChildren()) do hook(c) end
 	track(Trade.ChildAdded:Connect(hook))
+end
+
+---------------------------------------------------------------- death / reset / respawn handler
+do
+	local function onChar(ch)
+		B.charGen=B.charGen+1
+		B.readyAt=os.clock()+2          -- let the new character settle before the bot acts again
+		pcall(refreshVisited)           -- refresh the visited list
+		pcall(preview)                  -- refresh the values list
+		local hum=ch:WaitForChild("Humanoid",10)
+		if hum then
+			track(hum.Died:Connect(function()
+				B.charGen=B.charGen+1   -- cancels the current target immediately
+				if S.begStopOnDeath and B.running then
+					B.running=false; S.begWasOn=false; save()
+					pcall(function() begToggle:Set(false) end)
+					B.setStatus("stopped (you died)"); B.target=nil
+					log("Beg: stopped because you died")
+				end
+			end))
+		end
+	end
+	if LP.Character then task.spawn(onChar,LP.Character) end
+	track(LP.CharacterAdded:Connect(onChar))
 end
 
 ---------------------------------------------------------------- boot
