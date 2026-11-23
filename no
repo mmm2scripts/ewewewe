@@ -487,7 +487,7 @@ local function invoke(remote,limit,...)   -- RemoteFunction call that can never 
 	local args=table.pack(...); local done,ok,res=false,false,nil
 	task.spawn(function() ok,res=pcall(function() return remote:InvokeServer(table.unpack(args,1,args.n)) end); done=true end)
 	local w=0
-	while not done and w<limit do task.wait(.1); w=w+.1 end
+	while not done and w<limit do w=w+task.wait() end
 	if done and ok then return res end
 end
 local function isItem(id) return type(id)=="string" and DB[id]~=nil end
@@ -542,23 +542,56 @@ local function detectFromGui()   -- visible item names only, unique names only, 
 	end)
 	return out
 end
+local INV={best=nil,failAt=-1e9}   -- the fastest known way to read the inventory (remembered after the first success)
+local function readWith(c,arg,limit)
+	local res
+	if arg=="none" then res=invoke(c.remote,limit) else res=invoke(c.remote,limit,MY_NAME) end
+	if type(res)=="table" then local m=parsePayload(res); return m,countKeys(m) end
+	return nil,-1
+end
 local function detectInventory()   -- call from a task.spawn
 	local rep={source="none",tried={},guiOnly=false}
-	local best,bn=nil,0
-	for _,c in ipairs(candidates()) do
-		for _,arg in ipairs({"none","name"}) do
-			local res
-			if arg=="none" then res=invoke(c.remote,4) else res=invoke(c.remote,4,MY_NAME) end
-			if type(res)=="table" then
-				local m=parsePayload(res); local n=countKeys(m)
-				rep.tried[#rep.tried+1]={label=c.label.." ("..arg..")",n=n}
-				if n>bn then best,bn=m,n; rep.source=c.label end
-			else rep.tried[#rep.tried+1]={label=c.label.." ("..arg..")",n=-1} end
-			if bn>0 then break end
-		end
-		if bn>0 then break end
+	-- 1) fast path: ask the remote that worked last time, one call
+	if INV.best and INV.best.remote.Parent then
+		local m,n=readWith(INV.best,INV.best.arg,3)
+		rep.tried[#rep.tried+1]={label=INV.best.label.." ("..INV.best.arg..")",n=n}
+		if m and n>0 then rep.source=INV.best.label; return m,rep end
+		INV.best=nil
 	end
-	if best then return best,rep end
+	-- 2) discovery: every candidate is asked at the same time, the first real answer wins (skipped for 60 s after a total miss)
+	if os.clock()-INV.failAt>=60 then
+		local jobs={}
+		for _,c in ipairs(candidates()) do for _,arg in ipairs({"none","name"}) do jobs[#jobs+1]={c=c,arg=arg,n=-1} end end
+		local pending=#jobs
+		for _,j in ipairs(jobs) do
+			task.spawn(function()
+				local ok,m,n=pcall(readWith,j.c,j.arg,2.5)
+				if ok then j.m,j.n=m,n end
+				j.done=true; pending=pending-1
+			end)
+		end
+		local t0=os.clock()
+		while pending>0 and os.clock()-t0<3 do
+			local found=false
+			for _,j in ipairs(jobs) do if j.done and j.n>0 then found=true break end end
+			if found then task.wait(.15) break end   -- short grace so a richer answer can still arrive
+			task.wait()
+		end
+		local bj
+		for _,j in ipairs(jobs) do
+			if j.done then
+				rep.tried[#rep.tried+1]={label=j.c.label.." ("..j.arg..")",n=j.n}
+				if j.n>(bj and bj.n or 0) then bj=j end
+			end
+		end
+		if bj then
+			INV.best={remote=bj.c.remote,label=bj.c.label,arg=bj.arg}
+			rep.source=bj.c.label
+			return bj.m,rep
+		end
+		INV.failAt=os.clock()
+	end
+	-- 3) inventory GUI (names only)
 	local g=detectFromGui()
 	if countKeys(g)>0 then rep.source="inventory GUI (visible names only, quantities not read)"; rep.guiOnly=true; return g,rep end
 	return nil,rep
@@ -1011,8 +1044,8 @@ do
 		for _,n in pairs(base) do baseTotal=baseTotal+n end
 		local nWant=countKeys(want)
 		local confirmed,allOk={},false
-		for attempt=1,4 do
-			task.wait(1.5+attempt)   -- the inventory can lag behind the trade
+		for attempt=1,10 do
+			task.wait(attempt==1 and .6 or .8)   -- the inventory can lag behind the trade; checked quickly, stops as soon as it shows
 			if not (B.running and alive) then break end
 			local ok,m,rep=pcall(detectInventory)
 			if not (ok and m and rep and not rep.guiOnly) then return "unknown" end
@@ -1022,7 +1055,7 @@ do
 			for _,n in pairs(m) do nowTotal=nowTotal+n end
 			if nc==nWant then allOk=true
 			elseif nc==0 and nowTotal>=baseTotal+offered then allOk=true; confirmed=want end   -- ids differ but the owned total went up
-			if allOk or (nc>0 and attempt>=3) then break end
+			if allOk or (nc>0 and attempt>=6) then break end
 		end
 		if allOk then return "ok",got end
 		if next(confirmed)==nil then return "failed" end
