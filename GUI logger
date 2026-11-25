@@ -1,0 +1,345 @@
+-- GUI Logger v3: viewer + copy + full contents of each frame
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+local CONFIG = {
+	Cooldown = 5,
+	LogPopups = true,
+	MinPopupSize = 50,
+	MaxEntries = 100,
+	DumpContents = true,      -- list everything inside a logged GUI
+	MaxContents = 100,        -- max descendants listed per entry
+	IncludeText = true,       -- show Text of labels/buttons/boxes
+	SkipLayoutObjects = true, -- hide UICorner, UIListLayout, UIStroke, etc.
+	UIName = "GuiLoggerUI",
+	IgnoreNames = {
+		["Chat"] = true,
+		["BubbleChat"] = true,
+		["PlayerList"] = true,
+		["GuiLoggerUI"] = true,
+	},
+}
+
+local VIEW_LIMIT = 15000 -- Roblox text properties cap at 16,384 characters
+local setclip = setclipboard or toclipboard
+
+----------------------------------------------------------------
+-- UI
+----------------------------------------------------------------
+local gui = Instance.new("ScreenGui")
+gui.Name = CONFIG.UIName
+gui.ResetOnSpawn = false
+gui.DisplayOrder = 999
+gui.Parent = playerGui
+
+local main = Instance.new("Frame")
+main.Size = UDim2.fromOffset(460, 320)
+main.Position = UDim2.fromOffset(20, 60)
+main.BackgroundColor3 = Color3.fromRGB(25, 25, 30)
+main.BorderSizePixel = 0
+main.Parent = gui
+Instance.new("UICorner", main).CornerRadius = UDim.new(0, 8)
+
+local titleBar = Instance.new("Frame")
+titleBar.Size = UDim2.new(1, 0, 0, 30)
+titleBar.BackgroundColor3 = Color3.fromRGB(40, 40, 48)
+titleBar.BorderSizePixel = 0
+titleBar.Parent = main
+Instance.new("UICorner", titleBar).CornerRadius = UDim.new(0, 8)
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, -230, 1, 0)
+title.Position = UDim2.fromOffset(10, 0)
+title.BackgroundTransparency = 1
+title.Text = "GUI Logger"
+title.TextColor3 = Color3.new(1, 1, 1)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 14
+title.TextXAlignment = Enum.TextXAlignment.Left
+title.Parent = titleBar
+
+local function makeButton(text, xOffset, color)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.fromOffset(50, 22)
+	b.Position = UDim2.new(1, xOffset, 0, 4)
+	b.BackgroundColor3 = color
+	b.Text = text
+	b.TextColor3 = Color3.new(1, 1, 1)
+	b.Font = Enum.Font.GothamBold
+	b.TextSize = 12
+	b.Parent = titleBar
+	Instance.new("UICorner", b).CornerRadius = UDim.new(0, 5)
+	return b
+end
+
+local dumpBtn  = makeButton("Dump", -220, Color3.fromRGB(70, 160, 90))
+local copyBtn  = makeButton("Copy", -165, Color3.fromRGB(50, 130, 220))
+local clearBtn = makeButton("Clear", -110, Color3.fromRGB(190, 70, 70))
+local hideBtn  = makeButton("–", -55, Color3.fromRGB(90, 90, 100))
+
+local scroll = Instance.new("ScrollingFrame")
+scroll.Size = UDim2.new(1, -10, 1, -40)
+scroll.Position = UDim2.fromOffset(5, 35)
+scroll.BackgroundTransparency = 1
+scroll.BorderSizePixel = 0
+scroll.ScrollBarThickness = 5
+scroll.CanvasSize = UDim2.new()
+scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+scroll.Parent = main
+
+local layout = Instance.new("UIListLayout")
+layout.Padding = UDim.new(0, 2)
+layout.Parent = scroll
+
+local copyBox = Instance.new("TextBox")
+copyBox.Size = UDim2.new(1, -10, 1, -40)
+copyBox.Position = UDim2.fromOffset(5, 35)
+copyBox.BackgroundColor3 = Color3.fromRGB(15, 15, 20)
+copyBox.TextColor3 = Color3.new(1, 1, 1)
+copyBox.Font = Enum.Font.Code
+copyBox.TextSize = 12
+copyBox.TextXAlignment = Enum.TextXAlignment.Left
+copyBox.TextYAlignment = Enum.TextYAlignment.Top
+copyBox.ClearTextOnFocus = false
+copyBox.MultiLine = true
+copyBox.TextWrapped = true
+copyBox.Visible = false
+copyBox.ZIndex = 5
+copyBox.Parent = main
+
+-- Dragging
+do
+	local dragging, dragStart, startPos
+	titleBar.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragging, dragStart, startPos = true, input.Position, main.Position
+		end
+	end)
+	UserInputService.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+			or input.UserInputType == Enum.UserInputType.Touch) then
+			local d = input.Position - dragStart
+			main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X,
+				startPos.Y.Scale, startPos.Y.Offset + d.Y)
+		end
+	end)
+	UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end)
+end
+
+----------------------------------------------------------------
+-- Log storage
+----------------------------------------------------------------
+local entries = {}
+local rows = {}
+
+local function flash(btn, text)
+	local old = btn.Text
+	btn.Text = text
+	task.delay(1.2, function() btn.Text = old end)
+end
+
+local function addEntry(text)
+	table.insert(entries, text)
+
+	local shown = text
+	if #shown > VIEW_LIMIT then
+		shown = shown:sub(1, VIEW_LIMIT) .. "\n... (truncated in view, Copy has the full text)"
+	end
+
+	local row = Instance.new("TextLabel")
+	row.Size = UDim2.new(1, -8, 0, 0)
+	row.AutomaticSize = Enum.AutomaticSize.Y
+	row.BackgroundColor3 = Color3.fromRGB(35, 35, 42)
+	row.BorderSizePixel = 0
+	row.Text = shown
+	row.TextColor3 = Color3.fromRGB(220, 220, 230)
+	row.Font = Enum.Font.Code
+	row.TextSize = 12
+	row.TextXAlignment = Enum.TextXAlignment.Left
+	row.TextYAlignment = Enum.TextYAlignment.Top
+	row.TextWrapped = true
+	row.LayoutOrder = #entries
+	row.Parent = scroll
+	table.insert(rows, row)
+
+	if #entries > CONFIG.MaxEntries then
+		table.remove(entries, 1)
+		table.remove(rows, 1):Destroy()
+	end
+
+	scroll.CanvasPosition = Vector2.new(0, math.huge)
+end
+
+copyBtn.MouseButton1Click:Connect(function()
+	local all = table.concat(entries, "\n\n")
+	if setclip then
+		local ok = pcall(setclip, all)
+		flash(copyBtn, ok and "Copied!" or "Failed")
+	else
+		-- Text boxes cap at 16,384 chars, so show the newest part if it's longer
+		if #all > VIEW_LIMIT then
+			all = "(older entries cut off)\n" .. all:sub(-VIEW_LIMIT)
+		end
+		copyBox.Text = all
+		copyBox.Visible = not copyBox.Visible
+		if copyBox.Visible then
+			copyBox:CaptureFocus()
+			copyBox.SelectionStart = 1
+			copyBox.CursorPosition = #all + 1
+			flash(copyBtn, "Ctrl+C")
+		end
+	end
+end)
+
+clearBtn.MouseButton1Click:Connect(function()
+	table.clear(entries)
+	for _, r in ipairs(rows) do r:Destroy() end
+	table.clear(rows)
+	copyBox.Visible = false
+end)
+
+local minimized = false
+hideBtn.MouseButton1Click:Connect(function()
+	minimized = not minimized
+	scroll.Visible = not minimized
+	copyBox.Visible = false
+	main.Size = minimized and UDim2.fromOffset(460, 30) or UDim2.fromOffset(460, 320)
+	hideBtn.Text = minimized and "+" or "–"
+end)
+
+----------------------------------------------------------------
+-- Contents dump
+----------------------------------------------------------------
+local function describe(d)
+	local parts = { d.ClassName }
+	if d:IsA("GuiObject") then
+		table.insert(parts, d.Visible and "visible" or "hidden")
+	end
+	if CONFIG.IncludeText and (d:IsA("TextLabel") or d:IsA("TextButton") or d:IsA("TextBox")) then
+		local t = d.Text:gsub("[\r\n]+", " ")
+		if #t > 40 then t = t:sub(1, 40) .. "…" end
+		if t ~= "" then table.insert(parts, 'text="' .. t .. '"') end
+	end
+	return table.concat(parts, " | ") .. " | " .. d:GetFullName()
+end
+
+local function dumpContents(root)
+	local lines, count, total = {}, 0, 0
+	for _, d in ipairs(root:GetDescendants()) do
+		if not (CONFIG.SkipLayoutObjects and d:IsA("UIComponent")) then
+			total += 1
+			if count < CONFIG.MaxContents then
+				count += 1
+				table.insert(lines, "  └ " .. describe(d))
+			end
+		end
+	end
+	if total > count then
+		table.insert(lines, string.format("  … %d more not shown (raise MaxContents)", total - count))
+	end
+	return lines, total
+end
+
+----------------------------------------------------------------
+-- Logging logic (anti-spam)
+----------------------------------------------------------------
+local lastLogged = {}
+local watched = {}
+
+local function shouldLog(key)
+	local now = os.clock()
+	local last = lastLogged[key]
+	if last and now - last < CONFIG.Cooldown then return false end
+	lastLogged[key] = now
+	return true
+end
+
+local function log(kind, inst, force)
+	local key = inst:GetFullName()
+	if not force and not shouldLog(key) then return end
+
+	local out = { string.format("[%s] %s | %s", os.date("%H:%M:%S"), kind, describe(inst)) }
+	if CONFIG.DumpContents then
+		local lines, total = dumpContents(inst)
+		out[1] ..= string.format("  (%d items inside)", total)
+		for _, l in ipairs(lines) do table.insert(out, l) end
+	end
+
+	local text = table.concat(out, "\n")
+	print("[GUI LOG] " .. text)
+	addEntry(text)
+end
+
+local function isBigEnough(g)
+	local s = g.AbsoluteSize
+	return s.X >= CONFIG.MinPopupSize and s.Y >= CONFIG.MinPopupSize
+end
+
+local function isPopupClass(d)
+	return d:IsA("Frame") or d:IsA("ScrollingFrame") or d:IsA("CanvasGroup")
+end
+
+local function watchPopup(g)
+	if watched[g] then return end
+	watched[g] = true
+	g:GetPropertyChangedSignal("Visible"):Connect(function()
+		if g.Visible and isBigEnough(g) then
+			task.wait() -- let its contents settle
+			log("POPUP SHOWN", g)
+		end
+	end)
+	g.Destroying:Connect(function() watched[g] = nil end)
+end
+
+local function hookDescendants(sg)
+	if not CONFIG.LogPopups then return end
+	for _, d in ipairs(sg:GetDescendants()) do
+		if isPopupClass(d) then watchPopup(d) end
+	end
+	sg.DescendantAdded:Connect(function(d)
+		if isPopupClass(d) then
+			watchPopup(d)
+			task.delay(0.3, function() -- wait for children to be added
+				if d.Parent and d.Visible and isBigEnough(d) then
+					log("NEW POPUP", d)
+				end
+			end)
+		end
+	end)
+end
+
+-- Dump button: full tree of every current ScreenGui (ignores cooldown)
+dumpBtn.MouseButton1Click:Connect(function()
+	for _, child in ipairs(playerGui:GetChildren()) do
+		if child:IsA("ScreenGui") and not CONFIG.IgnoreNames[child.Name] then
+			log("DUMP", child, true)
+		end
+	end
+	flash(dumpBtn, "Done")
+end)
+
+-- Existing GUIs: watch quietly
+for _, child in ipairs(playerGui:GetChildren()) do
+	if child:IsA("ScreenGui") and not CONFIG.IgnoreNames[child.Name] then
+		hookDescendants(child)
+	end
+end
+
+-- New ScreenGuis
+playerGui.ChildAdded:Connect(function(child)
+	if child:IsA("ScreenGui") and not CONFIG.IgnoreNames[child.Name] then
+		task.wait(0.3) -- let its contents load before dumping
+		log("NEW SCREENGUI", child)
+		hookDescendants(child)
+	end
+end)
+
+addEntry("Logger running. Press Dump to list everything currently open.")
